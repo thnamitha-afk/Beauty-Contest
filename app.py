@@ -1,9 +1,10 @@
-# app.py - Beauty Contest
+# app.py - Beauty Contest (hash-chained ledger version)
 # Commit -> Reveal -> Results (guess 2/3 of the class average)
 #
-# Works out of the box: the ledgers are append-only CSV files kept by the app.
-# Optional: set API_URL in Streamlit secrets to use an external Google Sheets
-# ledger instead (not required).
+# Every commit and reveal is stored as a block in ONE append-only chain.
+# Each block contains the hash of the previous block, so editing or deleting
+# any earlier row breaks the chain and is detected on the Results tab.
+# No setup needed: the ledger file is created by the app.
 
 import csv
 import hashlib
@@ -13,18 +14,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean
 
-import requests
 import streamlit as st
 
 K_FACTOR = 2 / 3
 ALLOWED_MIN, ALLOWED_MAX = 0, 100
+GENESIS = "0" * 64
 
 DATA_DIR = Path(__file__).parent / "ledger_data"
-FIELDS = {
-    "commits": ["timestamp_utc", "uni_id", "commit"],
-    "reveals": ["timestamp_utc", "uni_id", "number", "nonce"],
-}
-MIN_DT = datetime.min.replace(tzinfo=timezone.utc)
+LEDGER_FILE = "chain.csv"
+FIELDS = ["block", "timestamp_utc", "kind", "uni_id", "data", "prev_hash", "block_hash"]
 
 
 @st.cache_resource
@@ -37,19 +35,8 @@ def sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-def parse_ts(ts: str):
-    try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    except Exception:
-        return None
-
-
-def api_url():
-    try:
-        return st.secrets.get("API_URL")
-    except Exception:
-        return None
+def block_hash(block, ts, kind, uid, data, prev):
+    return sha256(f"{block}|{ts}|{kind}|{uid}|{data}|{prev}")
 
 
 def to_csv_text(fieldnames, rows):
@@ -61,32 +48,9 @@ def to_csv_text(fieldnames, rows):
     return buf.getvalue()
 
 
-# ---------------------------------------------------------------- ledger (append-only)
-def ledger_append(kind: str, record: dict):
-    api = api_url()
-    if api:
-        r = requests.post(api, json={"kind": kind, **record}, timeout=20)
-        r.raise_for_status()
-        return
-    DATA_DIR.mkdir(exist_ok=True)
-    path = DATA_DIR / f"{kind}.csv"
-    row = {"timestamp_utc": datetime.now(timezone.utc).isoformat(), **record}
-    with get_lock():
-        new = (not path.exists()) or path.stat().st_size == 0
-        with open(path, "a", newline="", encoding="utf-8") as f:  # append only
-            wr = csv.DictWriter(f, fieldnames=FIELDS[kind])
-            if new:
-                wr.writeheader()
-            wr.writerow(row)
-
-
-def ledger_read(kind: str):
-    api = api_url()
-    if api:
-        r = requests.get(api, params={"table": kind}, timeout=20)
-        r.raise_for_status()
-        return list(csv.DictReader(io.StringIO(r.text)))
-    path = DATA_DIR / f"{kind}.csv"
+# ---------------------------------------------------------------- chain (append-only)
+def read_chain():
+    path = DATA_DIR / LEDGER_FILE
     if not path.exists():
         return []
     with get_lock():
@@ -94,46 +58,75 @@ def ledger_read(kind: str):
             return list(csv.DictReader(f))
 
 
+def append_block(kind: str, uni_id: str, data: str):
+    """kind = 'commit' (data = commit hash) or 'reveal' (data = 'number|nonce')."""
+    DATA_DIR.mkdir(exist_ok=True)
+    path = DATA_DIR / LEDGER_FILE
+    with get_lock():
+        rows = []
+        if path.exists() and path.stat().st_size > 0:
+            with open(path, newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+        block = len(rows)
+        prev = rows[-1]["block_hash"] if rows else GENESIS
+        ts = datetime.now(timezone.utc).isoformat()
+        row = {
+            "block": block,
+            "timestamp_utc": ts,
+            "kind": kind,
+            "uni_id": uni_id,
+            "data": data,
+            "prev_hash": prev,
+            "block_hash": block_hash(block, ts, kind, uni_id, data, prev),
+        }
+        new = not path.exists() or path.stat().st_size == 0
+        with open(path, "a", newline="", encoding="utf-8") as f:  # append only
+            wr = csv.DictWriter(f, fieldnames=FIELDS)
+            if new:
+                wr.writeheader()
+            wr.writerow(row)
+        return row
+
+
+def verify_chain(rows):
+    """Recompute every block. Returns (ok, message)."""
+    prev = GENESIS
+    for i, r in enumerate(rows):
+        if str(r["block"]) != str(i):
+            return False, f"Block numbering broken at position {i}."
+        if r["prev_hash"] != prev:
+            return False, f"Chain broken at block {i}: previous hash does not match."
+        expected = block_hash(r["block"], r["timestamp_utc"], r["kind"], r["uni_id"], r["data"], r["prev_hash"])
+        if r["block_hash"] != expected:
+            return False, f"Block {i} was modified: its hash does not match its content."
+        prev = r["block_hash"]
+    return True, f"Chain is valid ({len(rows)} blocks)."
+
+
 # ---------------------------------------------------------------- results (consensus)
-def compute_results(commits_raw, reveals_raw):
-    commits = {}
-    for r in commits_raw:
+def compute_results(rows):
+    """Deterministic: depends only on the order of blocks."""
+    commits, reveals = {}, {}
+    for r in rows:
         uid = (r.get("uni_id") or "").strip()
-        ch = (r.get("commit") or "").strip()
-        ts = (r.get("timestamp_utc") or "").strip()
-        if not uid or not ch:
+        if not uid:
             continue
-        commits.setdefault(uid, []).append(
-            {"timestamp_utc": ts, "ts_parsed": parse_ts(ts), "uni_id": uid, "commit": ch}
-        )
+        b = int(r["block"])
+        if r["kind"] == "commit":
+            commits.setdefault(uid, []).append((b, r["data"].strip()))
+        elif r["kind"] == "reveal":
+            num, _, nonce = r["data"].partition("|")
+            reveals.setdefault(uid, []).append((b, num.strip(), nonce))
 
-    reveals = {}
-    for r in reveals_raw:
-        uid = (r.get("uni_id") or "").strip()
-        num = (r.get("number") or "").strip()
-        nonce = (r.get("nonce") or "").strip()
-        ts = (r.get("timestamp_utc") or "").strip()
-        if not uid or not num or not nonce:
-            continue
-        reveals.setdefault(uid, []).append(
-            {"timestamp_utc": ts, "ts_parsed": parse_ts(ts), "uni_id": uid, "number_raw": num, "nonce": nonce}
-        )
-
-    verified_rows, matched_commits = [], {}
+    table = []
     for uid, rlist in reveals.items():
-        latest_rev = sorted(rlist, key=lambda x: x["ts_parsed"] or MIN_DT)[-1]  # latest reveal
-        ts_rev = latest_rev["ts_parsed"] or MIN_DT
+        b_rev, num_raw, nonce = max(rlist, key=lambda x: x[0])  # latest reveal
         try:
-            num = int(latest_rev["number_raw"])
-        except Exception:
+            num = int(num_raw)
+        except ValueError:
             num = None
-
-        # latest commit made at or before that reveal
-        cands = [c for c in commits.get(uid, []) if (c["ts_parsed"] or MIN_DT) <= ts_rev]
-        cands.sort(key=lambda x: x["ts_parsed"] or MIN_DT)
-        chosen = cands[-1] if cands else None
-        if chosen:
-            matched_commits[uid] = chosen
+        earlier = [c for c in commits.get(uid, []) if c[0] < b_rev]  # commits before the reveal
+        chosen = max(earlier, key=lambda x: x[0]) if earlier else None
 
         reason, verified = "ok", False
         if chosen is None:
@@ -143,42 +136,35 @@ def compute_results(commits_raw, reveals_raw):
         elif not (ALLOWED_MIN <= num <= ALLOWED_MAX):
             reason = "out_of_range"
         else:
-            verified = sha256(f"{uid}|{num}|{latest_rev['nonce']}") == chosen["commit"]
+            verified = sha256(f"{uid}|{num}|{nonce}") == chosen[1]
             if not verified:
                 reason = "hash_mismatch"
-
-        verified_rows.append(
+        table.append(
             {
                 "uni_id": uid,
-                "timestamp_utc": latest_rev["timestamp_utc"],
                 "number": "" if num is None else str(num),
-                "nonce": latest_rev["nonce"],
-                "commit": chosen["commit"] if chosen else "",
-                "preimage_hash": "" if num is None else sha256(f"{uid}|{num}|{latest_rev['nonce']}"),
+                "nonce": nonce,
+                "commit_block": "" if chosen is None else str(chosen[0]),
+                "reveal_block": str(b_rev),
                 "verified": "True" if verified else "False",
                 "reason": reason,
             }
         )
 
-    valid = [(r["uni_id"], int(r["number"])) for r in verified_rows if r["verified"] == "True" and r["number"] != ""]
+    valid = [(r["uni_id"], int(r["number"])) for r in table if r["verified"] == "True"]
     if valid:
         avg_val = mean(n for _, n in valid)
         target = K_FACTOR * avg_val
-        distances = [(uid, n, abs(n - target)) for uid, n in valid]
-        min_dist = min(d for _, _, d in distances)
-        winners = [(uid, n, d) for uid, n, d in distances if abs(d - min_dist) < 1e-12]
+        dist = [(u, n, abs(n - target)) for u, n in valid]
+        min_dist = min(d for _, _, d in dist)
+        winners = [(u, n, d) for u, n, d in dist if abs(d - min_dist) < 1e-12]
     else:
         avg_val = target = min_dist = None
         winners = []
 
-    for r in verified_rows:
+    for r in table:
         r["distance"] = f"{abs(int(r['number']) - target):.6f}" if (r["verified"] == "True" and target is not None) else ""
-
-    leaderboard = sorted(verified_rows, key=lambda r: (r["verified"] != "True", r.get("distance") or "ZZZ", r["uni_id"]))
-    merged_commits = sorted(matched_commits.values(), key=lambda r: (r["uni_id"], r["timestamp_utc"]))
-    merged_reveals = sorted(
-        [r for r in verified_rows if r["verified"] == "True"], key=lambda r: (r["uni_id"], r["timestamp_utc"])
-    )
+    leaderboard = sorted(table, key=lambda r: (r["verified"] != "True", r["distance"] or "ZZZ", r["uni_id"]))
 
     lines = ["=== CLASS RESULTS ===", f"k_factor = {K_FACTOR}"]
     if valid:
@@ -188,7 +174,7 @@ def compute_results(commits_raw, reveals_raw):
             f"target = {target:.6f}",
             f"min_distance = {min_dist:.6f}",
             "winners:",
-        ] + [f"  - {uid} with {n} (distance {d:.6f})" for uid, n, d in winners]
+        ] + [f"  - {u} with {n} (distance {d:.6f})" for u, n, d in winners]
     else:
         lines.append("No valid verified reveals. Cannot compute winners.")
 
@@ -198,8 +184,6 @@ def compute_results(commits_raw, reveals_raw):
         "target": target,
         "winners": winners,
         "leaderboard": leaderboard,
-        "merged_commits": merged_commits,
-        "merged_reveals": merged_reveals,
         "results_txt": "\n".join(lines) + "\n",
     }
 
@@ -214,7 +198,7 @@ tab_commit, tab_reveal, tab_results = st.tabs(["Commit", "Reveal", "Results"])
 # ---- Commit ---------------------------------------------------------------
 with tab_commit:
     st.subheader("Commit")
-    st.write("Your number stays secret: only its hash is stored.")
+    st.write("Your number stays secret: only its hash is added to the chain.")
     uni_id = st.text_input("University ID", key="c_uid").strip()
     number = st.number_input("Your number (0–100)", ALLOWED_MIN, ALLOWED_MAX, 50, 1, key="c_num")
     nonce = st.text_input("Secret nonce (keep it safe)", key="c_nonce").strip()
@@ -231,8 +215,9 @@ with tab_commit:
             st.error("University ID and nonce cannot be empty.")
         else:
             try:
-                ledger_append("commits", {"uni_id": uni_id, "commit": sha256(f"{uni_id}|{int(number)}|{nonce}")})
-                st.success("Commit saved. You can commit again; the latest one counts.")
+                row = append_block("commit", uni_id, sha256(f"{uni_id}|{int(number)}|{nonce}"))
+                st.success(f"Commit added as block {row['block']}. You can commit again; the latest one counts.")
+                st.code(f"block_hash = {row['block_hash']}")
             except Exception as e:
                 st.error(f"Could not save: {e}")
 
@@ -249,13 +234,16 @@ with tab_reveal:
             st.error("University ID and nonce cannot be empty.")
         else:
             try:
-                ledger_append("reveals", {"uni_id": r_uid, "number": int(r_num), "nonce": r_nonce})
-                mine = [c for c in ledger_read("commits") if (c.get("uni_id") or "").strip() == r_uid]
-                latest = (mine[-1].get("commit") or "").strip() if mine else ""
+                mine = [c for c in read_chain() if c["kind"] == "commit" and c["uni_id"].strip() == r_uid]
+                latest = mine[-1]["data"].strip() if mine else ""
+                row = append_block("reveal", r_uid, f"{int(r_num)}|{r_nonce}")
                 if latest == sha256(f"{r_uid}|{int(r_num)}|{r_nonce}"):
-                    st.success("Reveal saved and it matches your commit ✅")
+                    st.success(f"Reveal added as block {row['block']} and it matches your commit ✅")
                 else:
-                    st.warning("Reveal saved, but it does NOT match your latest commit. Check your inputs and reveal again.")
+                    st.warning(
+                        f"Reveal added as block {row['block']}, but it does NOT match your latest commit. "
+                        "Check your inputs and reveal again."
+                    )
             except Exception as e:
                 st.error(f"Could not save: {e}")
 
@@ -263,14 +251,16 @@ with tab_reveal:
 with tab_results:
     st.subheader("Results")
     st.write(
-        "For each University ID: latest reveal, matched to the latest commit made before it. "
-        "A reveal counts if its hash matches that commit and the number is within 0–100."
+        "First the chain is verified block by block. Then, for each University ID, the latest reveal is matched to the "
+        "latest commit made before it. A reveal counts if its hash matches that commit and the number is within 0–100."
     )
     if st.button("Show results", type="primary"):
         try:
-            commits_raw, reveals_raw = ledger_read("commits"), ledger_read("reveals")
-            res = compute_results(commits_raw, reveals_raw)
-            st.caption(f"{len(commits_raw)} commits · {len(reveals_raw)} reveals")
+            rows = read_chain()
+            ok, msg = verify_chain(rows)
+            (st.success if ok else st.error)(("⛓️ " if ok else "⚠️ ") + msg)
+
+            res = compute_results(rows)
             if res["valid"]:
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Participants", len(res["valid"]))
@@ -282,26 +272,26 @@ with tab_results:
 
             st.markdown("**Leaderboard**")
             st.dataframe(
-                [{k: r.get(k, "") for k in ["uni_id", "number", "verified", "reason", "distance"]} for r in res["leaderboard"]],
+                [
+                    {k: r.get(k, "") for k in ["uni_id", "number", "verified", "reason", "distance"]}
+                    for r in res["leaderboard"]
+                ],
                 use_container_width=True,
             )
-            d1, d2 = st.columns(2)
-            d1.download_button(
+            with st.expander("Ledger blocks"):
+                st.dataframe(rows, use_container_width=True)
+
+            d1, d2, d3 = st.columns(3)
+            d1.download_button("chain.csv", to_csv_text(FIELDS, rows), "chain.csv", "text/csv")
+            d2.download_button(
                 "class_leaderboard.csv",
                 to_csv_text(
-                    ["uni_id", "number", "verified", "reason", "distance", "commit", "nonce", "timestamp_utc"],
+                    ["uni_id", "number", "verified", "reason", "distance", "commit_block", "reveal_block", "nonce"],
                     res["leaderboard"],
                 ),
                 "class_leaderboard.csv",
                 "text/csv",
             )
-            d2.download_button("class_results.txt", res["results_txt"], "class_results.txt", "text/plain")
-            d3, d4 = st.columns(2)
-            d3.download_button(
-                "commits.csv", to_csv_text(FIELDS["commits"], commits_raw), "commits.csv", "text/csv"
-            )
-            d4.download_button(
-                "reveals.csv", to_csv_text(FIELDS["reveals"], reveals_raw), "reveals.csv", "text/csv"
-            )
+            d3.download_button("class_results.txt", res["results_txt"], "class_results.txt", "text/plain")
         except Exception as e:
             st.error(f"Could not read the ledger: {e}")
